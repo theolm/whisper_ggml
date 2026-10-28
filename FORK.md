@@ -7,8 +7,8 @@ the default CPU behavior or Apple targets.
 
 - Upstream base: `sk3llo/whisper_ggml` `master` at `9bd9e7f` (package 2.8.1).
 - Fork version: `2.8.1+smartnotes.1`.
-- Tags are the authoritative dependency pins; the app must reference the tag, not
-  a branch.
+- The app pins an immutable commit on `smartnotes/vulkan`; never reference the
+  branch name. Tag a release separately when a new version is published.
 
 ## Android libraries
 
