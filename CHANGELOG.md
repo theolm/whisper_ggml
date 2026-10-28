@@ -1,3 +1,22 @@
+## 2.8.1+smartnotes.1
+
+* Validate the actual context backend; reject silent CPU execution in the Vulkan
+  library. Catch native transcription exceptions and free failed contexts before
+  returning a recoverable error. Rebuild from a clean, checksum-pinned tree with
+  the Vulkan-only ownership adapter and native boundary regression test.
+
+* SmartNotes fork: optional Android arm64 Vulkan transcription in
+  `libwhisper_vulkan.so`, while `libwhisper.so` stays the API 24 CPU library.
+* `Whisper(backend: WhisperBackend.vulkan)` selects the Vulkan library;
+  `Whisper.probeCapabilities()` reports availability without loading a model.
+* Native responses expose the backend actually used and stable error codes for
+  bounded CPU fallback.
+* Vulkan uses the tuned settings for the stock Xclipse driver: no FP16
+  arithmetic, host memory preferred, and Flash Attention disabled only for the
+  Vulkan build.
+* Rebuild the optional library with `tool/build_android_vulkan.sh`; the checked
+  in arm64 `.so` is produced from pinned whisper.cpp v1.9.1 sources.
+
 ## 2.8.1
 
 * Fixed the iOS podspec overriding the host app's build settings ([#32](https://github.com/sk3llo/whisper_ggml/issues/32)): it declared `IPHONEOS_DEPLOYMENT_TARGET = 15.6` and `CLANG_CXX_LANGUAGE_STANDARD = c++20` in `s.xcconfig`, which CocoaPods applies to the app's `Pods-Runner` xcconfig as well as to the plugin. On iOS that xcconfig outranks project-level build settings, and Flutter's template sets the deployment target at the project level. An app targeting iOS 16 or later this way was built for 15.6 and failed to compile wherever it called iOS 16 APIs without `#available` checks. Both settings now apply only to the plugin's own target, which still builds for iOS 15.6 with C++20. Thanks @TechupBusiness for the report and the suggested fix
@@ -144,4 +163,3 @@
 ## 1.0.0
 
 * Added support for Android and iOS
-

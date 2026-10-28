@@ -56,6 +56,40 @@ Requires Dart 3.7+ (Flutter 3.29+). On iOS, set the deployment target to
 15.6 or later both in `ios/Podfile` (`platform :ios, '15.6'`) and in
 Xcode (Runner → General → Minimum Deployments).
 
+### Android GPU (SmartNotes fork)
+
+This fork adds an optional Vulkan backend for Android `arm64-v8a` while keeping
+the API 24 CPU library unchanged:
+
+```dart
+final capabilities = await Whisper.probeCapabilities();
+// capabilities.vulkanAvailable, capabilities.deviceName
+
+final response = await Whisper(
+  model: WhisperModel.small,
+  backend: WhisperBackend.vulkan,
+).transcribe(
+  modelPath: modelPath,
+  transcribeRequest: TranscribeRequest(audio: wavPath, language: 'en'),
+);
+print(response.backend); // cpu or vulkan, the backend actually used
+```
+
+The Vulkan library is `libwhisper_vulkan.so`; it is only built for arm64 and is
+safe for callers to use only when `probeCapabilities()` succeeds. Native failures
+are reported as `WhisperException` with stable codes so callers can retry once on
+the CPU. The CPU library remains the default and is the only library loaded by
+non-Android platforms.
+
+Rebuild the optional library from pinned sources with:
+
+```sh
+tool/build_android_vulkan.sh /path/to/scratch
+```
+
+The script checks whisper.cpp v1.9.1, SPIRV-Headers, and Vulkan-Headers archives
+by SHA-256 and writes `android/src/main/jniLibs/arm64-v8a/libwhisper_vulkan.so`.
+
 ## Quick start
 
 ```dart

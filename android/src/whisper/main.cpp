@@ -1,6 +1,11 @@
 #include "main.h"
 #include "whisper.cpp/include/whisper.h"
 
+#ifdef WHISPER_GGML_VULKAN
+#include "whisper.cpp/ggml/include/ggml-vulkan.h"
+extern "C" bool whisper_ggml_uses_vulkan(const whisper_context * ctx);
+#endif
+
 #define DR_WAV_IMPLEMENTATION
 #include "whisper.cpp/examples/dr_wav.h"
 
@@ -8,6 +13,8 @@
 #include <string>
 #include <thread>
 #include <mutex>
+#include <memory>
+#include <utility>
 #include <algorithm>
 #include <cstdlib>
 #include <vector>
@@ -17,6 +24,60 @@
 #include "json/json.hpp"
 
 using json = nlohmann::json;
+
+// The Vulkan build is a separate shared library (libwhisper_vulkan.so) so the
+// API 24 CPU library never has to resolve Vulkan 1.1 symbols. These tuned
+// defaults only apply to that library; the CPU build keeps whisper.cpp's
+// defaults untouched.
+//
+// The environment is set at library load, before a capability probe or the
+// first context can initialize the Vulkan backend. Setting it later would be
+// too late: ggml reads these flags while creating the device.
+#ifdef WHISPER_GGML_VULKAN
+namespace {
+struct VulkanDefaults {
+    VulkanDefaults() {
+        setenv("GGML_VK_DISABLE_F16", "1", 0);
+        setenv("GGML_VK_PREFER_HOST_MEMORY", "1", 0);
+    }
+};
+const VulkanDefaults g_vulkan_defaults;
+} // namespace
+#endif
+
+static void apply_backend_context_params(whisper_context_params & cparams)
+{
+#ifdef WHISPER_GGML_VULKAN
+    cparams.use_gpu = true;
+    // Tuned on the stock Xclipse driver: Vulkan is faster without Flash
+    // Attention, while the CPU build keeps whisper.cpp's default.
+    cparams.flash_attn = false;
+#else
+    cparams.use_gpu = false; // CPU-only build
+#endif
+}
+
+static const char * backend_name()
+{
+#ifdef WHISPER_GGML_VULKAN
+    return "vulkan";
+#else
+    return "cpu";
+#endif
+}
+
+static void apply_gpu_error_code(json & result, const char * vulkan_code,
+                                 const char * cpu_code)
+{
+#ifdef WHISPER_GGML_VULKAN
+    result["code"] = vulkan_code;
+    (void) cpu_code;
+#else
+    result["code"] = cpu_code;
+    (void) vulkan_code;
+#endif
+}
+
 
 char *jsonToChar(json jsonData) noexcept
 {
@@ -152,7 +213,7 @@ json release_model() noexcept
     return jsonResult;
 }
 
-json transcribe(json jsonBody) noexcept
+json transcribe(json jsonBody)
 {
     whisper_params params;
 
@@ -252,7 +313,7 @@ json transcribe(json jsonBody) noexcept
     if (ctx == nullptr)
     {
         struct whisper_context_params cparams = whisper_context_default_params();
-        cparams.use_gpu = false; // CPU-only build
+        apply_backend_context_params(cparams);
         ctx = whisper_init_from_file_with_params(params.model.c_str(), cparams);
     }
     if (ctx == nullptr)
@@ -261,32 +322,21 @@ json transcribe(json jsonBody) noexcept
         // whisper_full instead of surfacing an error response.
         jsonResult["@type"] = "error";
         jsonResult["message"] = "failed to load model " + params.model;
+        apply_gpu_error_code(jsonResult, "vulkan_init_failed", "model_load_failed");
         return jsonResult;
     }
-    // Park or free the context on every exit path (including WAV validation
-    // errors: a bad file must not cost the next request a model reload).
-    auto release_ctx = [&]() noexcept
-    {
-        if (!params.keep_model_loaded)
-        {
-            whisper_free(ctx);
-            return;
-        }
-        struct whisper_context *displaced = nullptr;
-        {
-            std::lock_guard<std::mutex> lock(g_model_cache.mutex);
-            displaced = g_model_cache.ctx;
-            g_model_cache.ctx = ctx;
-            g_model_cache.model = params.model;
-            g_model_cache.vad_model = ctx_vad_model;
-        }
-        // A concurrent request may have parked its own context while this
-        // one was decoding; only one can stay resident.
-        if (displaced != nullptr)
-        {
-            whisper_free(displaced);
-        }
-    };
+    // Unwind native resources before request() returns an error to Dart. Never
+    // park a context after an exception or a failed inference.
+    std::unique_ptr<whisper_context, decltype(&whisper_free)> owner(ctx, whisper_free);
+    auto release_ctx = [&]() { owner.reset(); };
+#ifdef WHISPER_GGML_VULKAN
+    if (!whisper_ggml_uses_vulkan(ctx)) {
+        jsonResult["@type"] = "error";
+        jsonResult["code"] = "vulkan_unavailable";
+        jsonResult["message"] = "The context has no active Vulkan backend";
+        return jsonResult;
+    }
+#endif
     std::string text_result = "";
     const auto fname_inp = params.audio;
     // WAV input
@@ -297,6 +347,7 @@ json transcribe(json jsonBody) noexcept
         {
             jsonResult["@type"] = "error";
             jsonResult["message"] = " failed to open WAV file ";
+            jsonResult["code"] = "invalid_audio";
             release_ctx();
             return jsonResult;
         }
@@ -305,6 +356,7 @@ json transcribe(json jsonBody) noexcept
         {
             jsonResult["@type"] = "error";
             jsonResult["message"] = "must be mono or stereo";
+            jsonResult["code"] = "invalid_audio";
             drwav_uninit(&wav);
             release_ctx();
             return jsonResult;
@@ -314,6 +366,7 @@ json transcribe(json jsonBody) noexcept
         {
             jsonResult["@type"] = "error";
             jsonResult["message"] = "WAV file  must be 16 kHz";
+            jsonResult["code"] = "invalid_audio";
             drwav_uninit(&wav);
             release_ctx();
             return jsonResult;
@@ -323,6 +376,7 @@ json transcribe(json jsonBody) noexcept
         {
             jsonResult["@type"] = "error";
             jsonResult["message"] = "WAV file  must be 16 bit";
+            jsonResult["code"] = "invalid_audio";
             drwav_uninit(&wav);
             release_ctx();
             return jsonResult;
@@ -363,6 +417,7 @@ json transcribe(json jsonBody) noexcept
     // run the inference
     {
         whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+
 
         wparams.print_realtime = false;
         wparams.print_progress = false;
@@ -425,6 +480,7 @@ json transcribe(json jsonBody) noexcept
         {
             jsonResult["@type"] = "error";
             jsonResult["message"] = "failed to process audio";
+            apply_gpu_error_code(jsonResult, "vulkan_inference_failed", "inference_failed");
             release_ctx();
             return jsonResult;
         }
@@ -472,8 +528,15 @@ json transcribe(json jsonBody) noexcept
         }
     }
     jsonResult["text"] = text_result;
+    jsonResult["backend"] = backend_name();
 
-    release_ctx();
+    if (params.keep_model_loaded) {
+        std::lock_guard<std::mutex> lock(g_model_cache.mutex);
+        // Copy strings before transferring context ownership (copies can throw).
+        g_model_cache.model = params.model;
+        g_model_cache.vad_model = ctx_vad_model;
+        owner.reset(std::exchange(g_model_cache.ctx, owner.release()));
+    }
     return jsonResult;
 }
 extern "C"
@@ -492,10 +555,18 @@ extern "C"
                 {
                     return jsonToChar(transcribe(jsonBody));
                 }
-                catch (const std::exception &e)
+                catch (const json::exception &)
                 {
                     jsonResult["@type"] = "error";
-                    jsonResult["message"] = e.what();
+                    jsonResult["message"] = "Invalid transcription request";
+                    jsonResult["code"] = "invalid_request";
+                    return jsonToChar(jsonResult);
+                }
+                catch (const std::exception &)
+                {
+                    jsonResult["@type"] = "error";
+                    jsonResult["message"] = "Native transcription failed";
+                    apply_gpu_error_code(jsonResult, "vulkan_inference_failed", "native_error");
                     return jsonToChar(jsonResult);
                 }
             }
@@ -509,9 +580,56 @@ extern "C"
                 jsonResult["message"] = "lib version: v1.0.1";
                 return jsonToChar(jsonResult);
             }
+            if (jsonBody["@type"] == "getCapabilities")
+            {
+                jsonResult["@type"] = "capabilities";
+                jsonResult["backend"] = backend_name();
+                jsonResult["runtime"] =
+                    "whisper_ggml 2.8.1+smartnotes.1; whisper.cpp 1.9.1";
+#ifdef WHISPER_GGML_VULKAN
+                jsonResult["vulkan_compiled"] = true;
+                int device_count = 0;
+                bool available = false;
+                try
+                {
+                    device_count = ggml_backend_vk_get_device_count();
+                    available = device_count > 0;
+                    if (available)
+                    {
+                        char description[256] = {0};
+                        ggml_backend_vk_get_device_description(
+                            0, description, sizeof(description));
+                        jsonResult["device_name"] = std::string(description);
+                        size_t free_bytes = 0;
+                        size_t total_bytes = 0;
+                        ggml_backend_vk_get_device_memory(
+                            0, &free_bytes, &total_bytes);
+                        jsonResult["free_memory_bytes"] =
+                            static_cast<uint64_t>(free_bytes);
+                        jsonResult["total_memory_bytes"] =
+                            static_cast<uint64_t>(total_bytes);
+                    }
+                }
+                catch (const std::exception &e)
+                {
+                    // A driver without a usable Vulkan device is a normal
+                    // unsupported state, not a request failure.
+                    available = false;
+                    jsonResult["capability_error"] = e.what();
+                }
+                jsonResult["vulkan_available"] = available;
+                jsonResult["device_count"] = device_count;
+#else
+                jsonResult["vulkan_compiled"] = false;
+                jsonResult["vulkan_available"] = false;
+                jsonResult["device_count"] = 0;
+#endif
+                return jsonToChar(jsonResult);
+            }
 
             jsonResult["@type"] = "error";
             jsonResult["message"] = "method not found";
+            jsonResult["code"] = "method_not_found";
             return jsonToChar(jsonResult);
         }
         catch (const std::exception &e)
@@ -519,6 +637,7 @@ extern "C"
             json jsonResult;
             jsonResult["@type"] = "error";
             jsonResult["message"] = e.what();
+            jsonResult["code"] = "native_error";
             return jsonToChar(jsonResult);
         }
     }
@@ -747,7 +866,7 @@ extern "C"
         }
         if (g_stream.ctx == nullptr) {
             whisper_context_params cparams = whisper_context_default_params();
-            cparams.use_gpu = false; // CPU-only build
+            apply_backend_context_params(cparams);
             g_stream.ctx = whisper_init_from_file_with_params(model.c_str(), cparams);
         }
         if (g_stream.ctx == nullptr) {

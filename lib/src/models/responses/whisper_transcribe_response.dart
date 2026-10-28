@@ -15,6 +15,9 @@ abstract class WhisperTranscribeResponse with _$WhisperTranscribeResponse {
     required String text,
     @JsonKey(name: 'segments')
     required List<WhisperTranscribeSegment>? segments,
+
+    /// Backend that actually produced the transcript: `cpu` or `vulkan`.
+    @JsonKey(name: 'backend') @Default('cpu') String backend,
   }) = _WhisperTranscribeResponse;
 
   const WhisperTranscribeResponse._();
